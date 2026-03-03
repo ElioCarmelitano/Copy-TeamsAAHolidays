@@ -1,121 +1,97 @@
+#Requires -Modules MicrosoftTeams
+
 <#
-    .SYNOPSIS
-    Copies Teams Auto Attendant (AA) Holiday configuration (holidays + actions) from one AA to one or more other AAs.
+.SYNOPSIS
+    Copies Teams Auto Attendant (AA) Holiday configuration from a source AA to one or more target AAs.
 
-    .DESCRIPTION
-    This function duplicates the "Holiday" behaviour from a source Auto Attendant to one or more target Auto Attendants by copying:
+.DESCRIPTION
+    Duplicates Holiday call handling behaviour from a source Auto Attendant to target AAs by copying:
+      1. Holiday Call Handling Associations (Type = Holiday)
+      2. Call Flows referenced by those associations (cloned with new IDs per target)
+      3. Schedules referenced by those associations (reused; same ScheduleId shared across AAs)
 
-      1) Holiday Call Handling Associations (Type = Holiday)
-         - These determine which call flow is executed when a holiday schedule is in effect.
+    Schedule dates/times are SHARED (same ScheduleId).
+    Call flows are COPIED per target (new CallFlowId), allowing independent edits later.
 
-      2) Call Flows referenced by those Holiday associations
-         - Call flows contain the greetings, menus, menu options and actions (transfer targets, disconnect, etc.).
-         - Call flows are CLONED to each target (new CallFlow IDs), so holiday actions can diverge per AA later.
+.NOTES
+    SCHEDULE SHARING : Editing holiday dates later will affect ALL AAs sharing that schedule.
+                       Use New-CsOnlineSchedule to create independent schedules if needed.
+    OVERWRITE        : By default, existing Holiday associations and matching call flows are
+                       removed from each target before copying. Non-holiday config is never touched.
 
-      3) Schedules referenced by those Holiday associations
-         - IMPORTANT: This function REUSES the existing Schedule IDs from the source.
-           Teams treats schedules as service-managed objects; inventing new schedule GUIDs will fail.
-         - Reusing schedule IDs means the same holiday schedule can be shared across multiple AAs.
-
-    Resulting behaviour:
-      - Holiday dates/times (the schedule) are SHARED between source and targets (same ScheduleId).
-      - Holiday actions (call flows) are COPIED per target (new CallFlowId), so actions can be edited independently.
-
-    .REQUIREMENTS
+.REQUIREMENTS
     - MicrosoftTeams PowerShell module installed.
-    - Connected session to Teams PowerShell:
-        Connect-MicrosoftTeams
-    - Account running the function must have permissions to read and modify Auto Attendants.
-      (Typically Teams Administrator / Teams Communications Administrator, or equivalent delegated rights.)
+    - Active Teams PowerShell session: Connect-MicrosoftTeams
+    - Teams Administrator / Teams Communications Administrator role (or equivalent).
 
-    .PREREQUISITES / ASSUMPTIONS
-    - Source AA must already contain at least one Holiday call handling association.
-    - Target AAs exist in the same tenant.
-    - If -Interactive is used:
-        - Out-GridView must be available (typically Windows PowerShell / Windows desktop with ISE/RSAT components).
+.PARAMETER SourceAAName
+    Source Auto Attendant name (exact match). Required when -Interactive is not used.
 
-    .SAFETY / CHANGE CONTROL
-    - Supports -WhatIf and -Confirm via SupportsShouldProcess.
-      Example:
-        Copy-TeamsAAHolidays -Interactive -WhatIf
+.PARAMETER TargetAANames
+    One or more target Auto Attendant names (exact match). Required when -Interactive is not used.
 
-    - Overwrite behaviour:
-      By default (-OverwriteTargetHolidays = $true), the function will:
-        - Remove existing Holiday call handling associations from each target.
-        - Remove any existing target call flows whose names match the source holiday call flow names
-          (prevents duplicate call flows when re-running).
-      It will NOT remove:
-        - Default call flow
-        - AfterHours associations/call flows
-        - Non-Holiday associations/call flows
+.PARAMETER Interactive
+    Uses Out-GridView pickers to select Source and Target AAs.
+    Requires a Windows desktop environment with Out-GridView available.
 
-    .LIMITATIONS
-    - Because schedules are reused, editing the holiday schedule dates later will affect ALL AAs sharing that schedule.
-      If you require fully independent schedules per AA, you must create new schedules using New-CsOnlineSchedule
-      and build new Holiday associations referencing those new schedule IDs.
+.PARAMETER NoOverwrite
+    When specified, preserves existing Holiday configuration on targets (no replacement).
+    Default behaviour removes Holiday associations and matching call flows before copying.
 
-    .PARAMETER SourceAAName
-    Source Auto Attendant Name (exact match). Used when not running interactively.
-
-    .PARAMETER TargetAANames
-    One or more target Auto Attendant Names (exact match). Used when not running interactively.
-
-    .PARAMETER Interactive
-    When specified, displays Out-GridView pickers to select:
-      - One Source AA
-      - One or more Target AAs
-
-    .PARAMETER OverwriteTargetHolidays
-    When true (default), overwrites Holiday config on the target:
-      - Removes Holiday call handling associations
-      - Removes call flows with names matching the source holiday call flows (dedupe)
-
-    .EXAMPLE
-    # Interactive dry run (no changes)
+.EXAMPLE
+    # Interactive dry run - no changes made
     Copy-TeamsAAHolidays -Interactive -WhatIf
 
-    .EXAMPLE
-    # Copy holidays from "Test1" to "Test2" and "Test3"
-    Copy-TeamsAAHolidays -SourceAAName "Test1" -TargetAANames @("Test2","Test3")
+.EXAMPLE
+    # Copy holidays from "Main AA" to two targets
+    Copy-TeamsAAHolidays -SourceAAName "Main AA" -TargetAANames "Reception", "Support"
 
-    #>
-
+.EXAMPLE
+    # Capture results for logging
+    $results = Copy-TeamsAAHolidays -SourceAAName "Main AA" -TargetAANames "Reception"
+    $results | Where-Object Status -eq 'Failed'
+#>
 function Copy-TeamsAAHolidays {
-    [CmdletBinding(SupportsShouldProcess)]
+    [CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'Named')]
+    [OutputType([PSCustomObject])]
     param(
-        # Use either names OR interactive picker
-        [Parameter(Mandatory = $false)]
+        [Parameter(Mandatory, ParameterSetName = 'Named')]
+        [ValidateNotNullOrEmpty()]
         [string]$SourceAAName,
 
-        [Parameter(Mandatory = $false)]
+        [Parameter(Mandatory, ParameterSetName = 'Named')]
+        [ValidateNotNullOrEmpty()]
         [string[]]$TargetAANames,
 
-        # If set, uses Out-GridView to pick Source + Targets
+        [Parameter(Mandatory, ParameterSetName = 'Interactive')]
         [switch]$Interactive,
 
-        # Overwrite target holiday associations/callflows (recommended)
-        [switch]$OverwriteTargetHolidays = $true
+        # Flip of the original $OverwriteTargetHolidays = $true;
+        # absence of this switch means "do overwrite" which is the safe default.
+        [switch]$NoOverwrite
     )
 
-    $ErrorActionPreference = "Stop"
+    $ErrorActionPreference = 'Stop'
 
-    # ---- Get all auto attendants once ----
+    # ── Retrieve all Auto Attendants once ──────────────────────────────────────
+    Write-Verbose "Retrieving all Auto Attendants..."
     $allAAs = @(Get-CsAutoAttendant)
 
-    if (-not $allAAs -or $allAAs.Count -eq 0) {
-        throw "No Auto Attendants returned. Are you connected to Teams PowerShell?"
+    if ($allAAs.Count -eq 0) {
+        throw "No Auto Attendants returned. Verify your session: Connect-MicrosoftTeams"
     }
 
-    # ---- Interactive selection ----
-    if ($Interactive) {
+    # ── Resolve source and target identities ───────────────────────────────────
+    if ($PSCmdlet.ParameterSetName -eq 'Interactive') {
 
         if (-not (Get-Command Out-GridView -ErrorAction SilentlyContinue)) {
-            throw "Out-GridView is not available on this machine. Install the needed components or run without -Interactive."
+            throw "Out-GridView is unavailable. Use -SourceAAName / -TargetAANames instead."
         }
 
         $sourcePick = $allAAs |
             Select-Object Name, Identity |
-            Out-GridView -Title "Select SOURCE Auto Attendant (single selection)" -PassThru
+            Out-GridView -Title "Select SOURCE Auto Attendant (single selection)" -PassThru |
+            Select-Object -First 1
 
         if (-not $sourcePick) { throw "No source Auto Attendant selected." }
         $srcId = $sourcePick.Identity
@@ -129,102 +105,148 @@ function Copy-TeamsAAHolidays {
         $tgtIds = @($targetPick.Identity)
     }
     else {
-        if ([string]::IsNullOrWhiteSpace($SourceAAName)) { throw "Provide -SourceAAName or use -Interactive." }
-        if (-not $TargetAANames -or $TargetAANames.Count -eq 0) { throw "Provide -TargetAANames or use -Interactive." }
-
-        $src = $allAAs | Where-Object { $_.Name -eq $SourceAAName } | Select-Object -First 1
-        if (-not $src) { throw "Source AA with Name '$SourceAAName' not found (name match is case-insensitive but must be exact)." }
+        $src = $allAAs | Where-Object Name -eq $SourceAAName | Select-Object -First 1
+        if (-not $src) { throw "Source AA '$SourceAAName' not found. Name must be an exact match." }
         $srcId = $src.Identity
 
-        $tgtIds = foreach ($n in $TargetAANames) {
-            $t = $allAAs | Where-Object { $_.Name -eq $n } | Select-Object -First 1
-            if (-not $t) { throw "Target AA with Name '$n' not found (name match must be exact)." }
+        # foreach returns values; collected into array implicitly
+        $tgtIds = foreach ($name in $TargetAANames) {
+            $t = $allAAs | Where-Object Name -eq $name | Select-Object -First 1
+            if (-not $t) { throw "Target AA '$name' not found. Name must be an exact match." }
             $t.Identity
         }
     }
 
-    # ---- Load source AA details ----
+    # ── Load and validate source AA ────────────────────────────────────────────
+    Write-Verbose "Loading source AA '$srcId'..."
     $srcAA = Get-CsAutoAttendant -Identity $srcId
 
-    # Holiday associations only
-    $srcHolidayAssocs = @($srcAA.CallHandlingAssociations | Where-Object { $_.Type -eq "Holiday" })
-    if ($srcHolidayAssocs.Count -eq 0) { throw "No Holiday associations found on source AA '$($srcAA.Name)'." }
+    $srcHolidayAssocs = @($srcAA.CallHandlingAssociations | Where-Object Type -eq 'Holiday')
+    if ($srcHolidayAssocs.Count -eq 0) {
+        throw "Source AA '$($srcAA.Name)' has no Holiday associations to copy."
+    }
 
-    # Lookups
-    $srcSchedulesById = @{}
-    foreach ($s in @($srcAA.Schedules)) { $srcSchedulesById[[string]$s.Id] = $s }
+    # Build lookup tables for fast O(1) access
+    $srcScheduleMap = @{}
+    foreach ($s  in @($srcAA.Schedules )) { $srcScheduleMap[[string]$s.Id]  = $s  }
 
-    $srcCallFlowsById = @{}
-    foreach ($cf in @($srcAA.CallFlows)) { $srcCallFlowsById[[string]$cf.Id] = $cf }
+    $srcCallFlowMap = @{}
+    foreach ($cf in @($srcAA.CallFlows  )) { $srcCallFlowMap[[string]$cf.Id] = $cf }
 
-    $srcHolidayScheduleIds = $srcHolidayAssocs | ForEach-Object { [string]$_.ScheduleId } | Select-Object -Unique
-    $srcHolidayCallFlowIds  = $srcHolidayAssocs | ForEach-Object { [string]$_.CallFlowId } | Select-Object -Unique
+    $srcHolidayScheduleIds = @($srcHolidayAssocs.ScheduleId | Select-Object -Unique)
+    $srcHolidayCallFlowIds  = @($srcHolidayAssocs.CallFlowId  | Select-Object -Unique)
 
+    # Validate all referenced IDs actually exist on the source
     foreach ($sid in $srcHolidayScheduleIds) {
-        if (-not $srcSchedulesById.ContainsKey($sid)) { throw "Holiday ScheduleId not found in source Schedules: $sid" }
+        if (-not $srcScheduleMap.ContainsKey([string]$sid)) {
+            throw "Holiday ScheduleId '$sid' not found in source AA schedules."
+        }
     }
     foreach ($cid in $srcHolidayCallFlowIds) {
-        if (-not $srcCallFlowsById.ContainsKey($cid)) { throw "Holiday CallFlowId not found in source CallFlows: $cid" }
+        if (-not $srcCallFlowMap.ContainsKey([string]$cid)) {
+            throw "Holiday CallFlowId '$cid' not found in source AA call flows."
+        }
     }
 
-    # Names of holiday call flows (used to dedupe target call flows on overwrite)
-    $srcHolidayCallFlowNames = $srcHolidayCallFlowIds | ForEach-Object { $srcCallFlowsById[$_].Name }
+    # Used to deduplicate target call flows when overwriting
+    $srcHolidayCallFlowNames = $srcHolidayCallFlowIds | ForEach-Object { $srcCallFlowMap[$_].Name }
 
-    # ---- Apply to each target ----
+    # ── Apply to each target ───────────────────────────────────────────────────
+    $results = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $i = 0
+
     foreach ($tid in $tgtIds) {
+        $i++
+        Write-Progress -Activity "Copying holiday configuration from '$($srcAA.Name)'" `
+                       -Status   "Target $i of $($tgtIds.Count): $tid" `
+                       -PercentComplete ([math]::Round(($i / $tgtIds.Count) * 100))
 
-        $tgtAA = Get-CsAutoAttendant -Identity $tid
+        try {
+            $tgtAA = Get-CsAutoAttendant -Identity $tid
 
-        if ($PSCmdlet.ShouldProcess($tgtAA.Name, "Copy Holiday schedules/call flows/associations from '$($srcAA.Name)'")) {
+            if (-not $PSCmdlet.ShouldProcess($tgtAA.Name, "Copy Holiday config from '$($srcAA.Name)'")) {
+                continue
+            }
 
-            if (-not $tgtAA.Schedules) { $tgtAA.Schedules = @() }
-            if (-not $tgtAA.CallFlows) { $tgtAA.CallFlows = @() }
+            # Ensure collections are never null
+            if (-not $tgtAA.Schedules              ) { $tgtAA.Schedules                = @() }
+            if (-not $tgtAA.CallFlows              ) { $tgtAA.CallFlows                = @() }
             if (-not $tgtAA.CallHandlingAssociations) { $tgtAA.CallHandlingAssociations = @() }
 
-            # Overwrite holiday config on target (remove only Holiday associations)
-            if ($OverwriteTargetHolidays) {
+            # ── Strip existing Holiday-only config (safe; non-holiday config untouched) ──
+            if (-not $NoOverwrite) {
                 $tgtAA.CallHandlingAssociations = @(
-                    $tgtAA.CallHandlingAssociations | Where-Object { $_.Type -ne "Holiday" }
+                    $tgtAA.CallHandlingAssociations | Where-Object Type -ne 'Holiday'
                 )
-
-                # Remove existing call flows with same names as source holiday call flows (prevents duplicates)
+                # Remove call flows whose names match source holiday call flow names (dedupe on re-run)
                 $tgtAA.CallFlows = @(
-                    $tgtAA.CallFlows | Where-Object { $srcHolidayCallFlowNames -notcontains $_.Name }
+                    $tgtAA.CallFlows | Where-Object { $_.Name -notin $srcHolidayCallFlowNames }
                 )
             }
 
-            # Ensure schedules exist on target (REUSE schedule IDs; do not invent new)
-            $existingTgtScheduleIds = @($tgtAA.Schedules | ForEach-Object { [string]$_.Id })
+            # ── Add missing schedules (reuse source IDs; new IDs will be rejected by Teams) ──
+            # Use a HashSet for O(1) existence checks
+            $existingScheduleIds = [System.Collections.Generic.HashSet[string]]::new(
+                [string[]]@($tgtAA.Schedules | ForEach-Object { [string]$_.Id })
+            )
             foreach ($sid in $srcHolidayScheduleIds) {
-                if ($existingTgtScheduleIds -notcontains $sid) {
-                    $tgtAA.Schedules += $srcSchedulesById[$sid]
+                if (-not $existingScheduleIds.Contains([string]$sid)) {
+                    Write-Verbose "  Adding schedule '$sid' to '$($tgtAA.Name)'"
+                    $tgtAA.Schedules += $srcScheduleMap[$sid]
                 }
             }
 
-            # Clone holiday call flows (new IDs), map source -> target
-            $callFlowIdMap = @{}
+            # ── Clone call flows with new GUIDs (so targets can diverge independently later) ──
+            $cfIdMap = @{}
             foreach ($cid in $srcHolidayCallFlowIds) {
-                $newCf = $srcCallFlowsById[$cid] | ConvertTo-Json -Depth 50 | ConvertFrom-Json
-                $newCf.Id = ([guid]::NewGuid().ToString())
-                $tgtAA.CallFlows += $newCf
-                $callFlowIdMap[$cid] = $newCf.Id
+                $clonedCf    = $srcCallFlowMap[$cid] | ConvertTo-Json -Depth 50 | ConvertFrom-Json
+                $clonedCf.Id = [guid]::NewGuid().ToString()
+                $tgtAA.CallFlows += $clonedCf
+                $cfIdMap[[string]$cid] = $clonedCf.Id
+                Write-Verbose "  Cloned call flow '$($srcCallFlowMap[$cid].Name)' -> $($clonedCf.Id)"
             }
 
-            # Recreate holiday associations
+            # ── Recreate Holiday associations pointing at cloned call flows ──
             foreach ($assoc in $srcHolidayAssocs) {
-                $oldCfId = [string]$assoc.CallFlowId
-                $newCfId = $callFlowIdMap[$oldCfId]
-                if ([string]::IsNullOrWhiteSpace($newCfId)) { throw "No mapped CallFlowId found for source CallFlowId: $oldCfId" }
+                $newCfId = $cfIdMap[[string]$assoc.CallFlowId]
+                if ([string]::IsNullOrWhiteSpace($newCfId)) {
+                    throw "No mapped CallFlowId for source CallFlowId '$($assoc.CallFlowId)'."
+                }
 
                 $tgtAA.CallHandlingAssociations += New-CsAutoAttendantCallHandlingAssociation `
-                    -Type "Holiday" `
+                    -Type       Holiday `
                     -ScheduleId ([string]$assoc.ScheduleId) `
                     -CallFlowId $newCfId
             }
 
             Set-CsAutoAttendant -Instance $tgtAA
 
-            Write-Host "Updated '$($tgtAA.Name)' from source '$($srcAA.Name)'" -ForegroundColor Green
+            $results.Add([PSCustomObject]@{ Target = $tgtAA.Name; Status = 'Success'; Error = $null })
+            Write-Verbose "Successfully updated '$($tgtAA.Name)'"
+        }
+        catch {
+            # Capture failure but continue with remaining targets
+            $results.Add([PSCustomObject]@{ Target = $tid; Status = 'Failed'; Error = $_.Exception.Message })
+            Write-Warning "Failed to update target '$tid': $_"
         }
     }
+
+    Write-Progress -Activity "Copying holiday configuration" -Completed
+
+    # ── Summary ────────────────────────────────────────────────────────────────
+    $succeeded = ($results | Where-Object Status -eq 'Success').Count
+    $failed    = ($results | Where-Object Status -eq 'Failed' ).Count
+
+    Write-Host "`nHoliday copy complete — Source: '$($srcAA.Name)'" -ForegroundColor Cyan
+    Write-Host "  Succeeded : $succeeded" -ForegroundColor Green
+
+    if ($failed -gt 0) {
+        Write-Host "  Failed    : $failed" -ForegroundColor Red
+        $results | Where-Object Status -eq 'Failed' | ForEach-Object {
+            Write-Host "    ✗ $($_.Target) — $($_.Error)" -ForegroundColor Red
+        }
+    }
+
+    # Return structured results for pipeline / logging use
+    return $results
 }
